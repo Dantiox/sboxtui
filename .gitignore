@@ -1,0 +1,9 @@
+/target/
+Cargo.lock
+config.toml
+config.json
+*.secret
+*.key
+*.db
+*.log
+.env

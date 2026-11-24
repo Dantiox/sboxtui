@@ -1,0 +1,23 @@
+# Example configuration for sboxtui (~/.config/sboxtui/config.toml)
+# Never commit real tokens, subscription URLs, or WireGuard keys.
+
+clash_api_url = "http://127.0.0.1:9097"
+# Path to a 0440/0600 file containing the Clash API Bearer secret, or set api_secret directly
+api_secret_file = "/etc/sing-box/api.secret"
+
+# Sing-box config managed by sboxtui (for sync / rules / interface edits)
+singbox_config_path = "/etc/sing-box/config.json"
+rules_dir = "/usr/local/share/sing-box"
+
+# Optional Clash YAML subscription URL (or pass --url on sync)
+subscription_url = "https://example.invalid/your-subscription-url"
+
+# Primary selector outbound tag inside config.json
+default_group = "proxy"
+
+# WireGuard / uplink topology
+# Use "auto" (auto_detect_interface) or bind explicitly e.g. "wg-lan" when on router WG
+default_interface = "auto"
+wg_lan_connection = "wg-lan"
+wg_remote_connection = "wg_mw"
+tun_mtu = 1400
