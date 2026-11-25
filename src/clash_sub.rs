@@ -325,6 +325,7 @@ pub fn build_singbox_config(
                 "outbound": "direct"
             },
             { "ip_is_private": true, "outbound": "direct" },
+            { "ip_cidr": ["100.64.0.0/10"], "outbound": "direct" },
             { "rule_set": ["geosite-category-ads-all"], "action": "reject" },
             { "rule_set": ["geoip-ru", "geosite-category-ru"], "outbound": "direct" }
         ],
@@ -375,7 +376,7 @@ pub fn build_singbox_config(
                 "mtu": tun_mtu,
                 "auto_route": true,
                 "strict_route": true,
-                "stack": "system"
+                "stack": "gvisor"
             }
         ],
         "outbounds": outbounds,

@@ -22,7 +22,7 @@ use std::path::PathBuf;
 #[command(
     name = "sboxtui",
     version,
-    about = "Energy-efficient TUI controller for sing-box (system stack) + Clash subscriptions + WireGuard"
+    about = "Energy-efficient TUI controller for sing-box (gvisor stack) + Clash subscriptions + WireGuard"
 )]
 struct Cli {
     #[command(subcommand)]

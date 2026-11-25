@@ -53,9 +53,6 @@ impl Tab {
 #[derive(Debug, Clone)]
 enum Modal {
     None,
-    FilterNodes {
-        query: String,
-    },
     AddRule {
         step: AddRuleStep,
         kind_idx: usize,
@@ -97,6 +94,7 @@ pub struct App {
     nm_conns: Vec<NmConnection>,
 
     node_filter: String,
+    searching_nodes: bool,
     node_state: TableState,
     rule_state: TableState,
     wg_state: TableState,
@@ -126,6 +124,7 @@ impl App {
             wifi_ssid: None,
             nm_conns: Vec::new(),
             node_filter: String::new(),
+            searching_nodes: false,
             node_state: TableState::default(),
             rule_state: TableState::default(),
             wg_state: TableState::default(),
@@ -185,10 +184,21 @@ impl App {
     }
 
     fn filtered_nodes(&self) -> Vec<&String> {
-        let q = self.node_filter.trim().to_lowercase();
+        let tokens: Vec<String> = self
+            .node_filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
         self.group_nodes
             .iter()
-            .filter(|name| q.is_empty() || name.to_lowercase().contains(&q))
+            .filter(|name| {
+                let proto = self
+                    .proxies
+                    .get(name.as_str())
+                    .map(|p| p.proxy_type.as_str())
+                    .unwrap_or("");
+                matches_node_query(name, proto, &tokens)
+            })
             .collect()
     }
 
@@ -211,6 +221,16 @@ impl App {
         }
         if !matches!(self.modal, Modal::None) {
             self.handle_modal_key(key);
+            return;
+        }
+        if self.searching_nodes && self.tab == Tab::Nodes {
+            self.handle_node_search_key(key);
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+            self.tab = Tab::Nodes;
+            self.searching_nodes = true;
             return;
         }
 
@@ -247,10 +267,15 @@ impl App {
                     let len = self.filtered_nodes().len();
                     move_table(&mut self.node_state, len, -1);
                 }
-                KeyCode::Char('/') => {
-                    self.modal = Modal::FilterNodes {
-                        query: self.node_filter.clone(),
-                    };
+                KeyCode::Char('/') | KeyCode::Char('f') => {
+                    self.searching_nodes = true;
+                }
+                KeyCode::Esc => {
+                    if !self.node_filter.is_empty() {
+                        self.node_filter.clear();
+                        self.node_state.select((!self.group_nodes.is_empty()).then_some(0));
+                        self.status_msg = "Filter cleared.".to_string();
+                    }
                 }
                 KeyCode::Enter => {
                     let selected = self
@@ -414,6 +439,53 @@ impl App {
         }
     }
 
+    fn handle_node_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.node_filter.clear();
+                self.searching_nodes = false;
+                self.node_state
+                    .select((!self.group_nodes.is_empty()).then_some(0));
+                self.status_msg = "Search cleared.".to_string();
+            }
+            KeyCode::Enter => {
+                self.searching_nodes = false;
+                self.status_msg = if self.node_filter.is_empty() {
+                    "Search closed.".to_string()
+                } else {
+                    format!("Filter active: '{}' (Esc to clear)", self.node_filter)
+                };
+            }
+            KeyCode::Down => {
+                let len = self.filtered_nodes().len();
+                move_table(&mut self.node_state, len, 1);
+            }
+            KeyCode::Up => {
+                let len = self.filtered_nodes().len();
+                move_table(&mut self.node_state, len, -1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let len = self.filtered_nodes().len();
+                move_table(&mut self.node_state, len, 1);
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let len = self.filtered_nodes().len();
+                move_table(&mut self.node_state, len, -1);
+            }
+            KeyCode::Backspace => {
+                self.node_filter.pop();
+                let len = self.filtered_nodes().len();
+                self.node_state.select((len > 0).then_some(0));
+            }
+            KeyCode::Char(c) => {
+                self.node_filter.push(c);
+                let len = self.filtered_nodes().len();
+                self.node_state.select((len > 0).then_some(0));
+            }
+            _ => {}
+        }
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let targets = self.available_targets();
         let mut next_modal = None;
@@ -422,19 +494,6 @@ impl App {
 
         match &mut self.modal {
             Modal::None => {}
-            Modal::FilterNodes { query } => match key.code {
-                KeyCode::Esc => next_modal = Some(Modal::None),
-                KeyCode::Enter => {
-                    self.node_filter = query.clone();
-                    self.node_state.select(Some(0));
-                    next_modal = Some(Modal::None);
-                }
-                KeyCode::Backspace => {
-                    query.pop();
-                }
-                KeyCode::Char(c) => query.push(c),
-                _ => {}
-            },
             Modal::SetWan { ifaces, cursor } => match key.code {
                 KeyCode::Esc => next_modal = Some(Modal::None),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -710,7 +769,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" sboxtui — sing-box (system stack) & WireGuard Control (AGPL-3.0) "),
+                .title(" sboxtui — sing-box (gvisor stack) & WireGuard Control (AGPL-3.0) "),
         )
         .select(app.tab as usize)
         .highlight_style(
@@ -729,11 +788,15 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
         Tab::Connections => draw_connections_tab(f, app, chunks[2]),
     }
 
-    let help = match app.tab {
-        Tab::Nodes => "[1-4/Tab] Tabs | [j/k] Move | [Enter] Select Node | [/] Filter | [p] Test Delay | [s] Sync Sub | [R] Refresh | [q] Quit",
-        Tab::Rules => "[j/k] Move | [a] Add Rule (process/geoip/geosite/cidr) | [d] Delete | [K/J] Priority | [w] Validate & Save | [q] Quit",
-        Tab::WireGuard => "[j/k] Move | [Enter/Space] Toggle NM WG/Wi-Fi | [u] Set sing-box Uplink | [R] Refresh | [q] Quit",
-        Tab::Connections => "[j/k] Move | [a] Add process_name Rule from Selected | [R] Refresh | [q] Quit",
+    let help = if app.searching_nodes && app.tab == Tab::Nodes {
+        "Search: type words/proto (e.g. 'фин hy2') | [Up/Down] Move | [Enter] Lock Filter | [Esc] Clear"
+    } else {
+        match app.tab {
+            Tab::Nodes => "[1-4/Tab] Tabs | [j/k] Move | [Enter] Select | [/ or f] Live Search | [Esc] Clear | [p] Delay | [s] Sync | [q] Quit",
+            Tab::Rules => "[j/k] Move | [a] Add Rule (process/geoip/geosite/cidr) | [d] Delete | [K/J] Priority | [w] Validate & Save | [q] Quit",
+            Tab::WireGuard => "[j/k] Move | [Enter/Space] Toggle NM WG/Wi-Fi | [u] Set sing-box Uplink | [R] Refresh | [q] Quit",
+            Tab::Connections => "[j/k] Move | [a] Add process_name Rule from Selected | [R] Refresh | [q] Quit",
+        }
     };
     let footer = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -768,7 +831,7 @@ fn draw_stats_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " | Stack: system | Uplink: {} (Wi-Fi: {ssid})",
+                " | Stack: gvisor | Uplink: {} (Wi-Fi: {ssid})",
                 app.default_interface
             )),
         ]),
@@ -782,8 +845,31 @@ fn draw_stats_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn draw_nodes_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let table_area = if app.searching_nodes {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(5)])
+            .split(area);
+        let search_box = Paragraph::new(format!("> {}_", app.node_filter))
+            .style(Style::default().fg(Color::Cyan))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Live Search (e.g. 'фин hy2', 'de vless') — Enter=lock, Esc=clear "),
+            );
+        f.render_widget(search_box, split[0]);
+        split[1]
+    } else {
+        area
+    };
+
     let active = app.active_node.clone();
     let filtered: Vec<String> = app.filtered_nodes().into_iter().cloned().collect();
+    if let Some(sel) = app.node_state.selected()
+        && sel >= filtered.len()
+    {
+        app.node_state.select((!filtered.is_empty()).then_some(0));
+    }
     let rows: Vec<Row> = filtered
         .iter()
         .map(|name| {
@@ -821,7 +907,12 @@ fn draw_nodes_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let title = if app.node_filter.is_empty() {
         format!(" Nodes ({}) ", filtered.len())
     } else {
-        format!(" Nodes ({}) [filter: {}] ", filtered.len(), app.node_filter)
+        format!(
+            " Nodes ({}/{}) [filter: {}] ",
+            filtered.len(),
+            app.group_nodes.len(),
+            app.node_filter
+        )
     };
     let table = Table::new(
         rows,
@@ -838,7 +929,7 @@ fn draw_nodes_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     )
     .block(Block::default().borders(Borders::ALL).title(title))
     .row_highlight_style(Style::default().bg(Color::DarkGray));
-    f.render_stateful_widget(table, area, &mut app.node_state);
+    f.render_stateful_widget(table, table_area, &mut app.node_state);
 }
 
 fn draw_rules_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
@@ -983,16 +1074,6 @@ fn draw_modal(f: &mut ratatui::Frame, app: &App) {
     let targets = app.available_targets();
     match &app.modal {
         Modal::None => {}
-        Modal::FilterNodes { query } => {
-            let area = centered_rect(50, 20, f.area());
-            f.render_widget(Clear, area);
-            let p = Paragraph::new(format!("Filter: {query}_")).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Filter Nodes (Enter/Esc) "),
-            );
-            f.render_widget(p, area);
-        }
         Modal::SetWan { ifaces, cursor } => {
             let area = centered_rect(45, 45, f.area());
             f.render_widget(Clear, area);
@@ -1099,4 +1180,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn matches_node_query(name: &str, proto: &str, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    let name_l = name.to_lowercase();
+    let proto_l = proto.to_lowercase();
+    tokens.iter().all(|tok| {
+        name_l.contains(tok)
+            || proto_l.contains(tok)
+            || (tok == "hy2" && proto_l == "hysteria2")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_multi_token_and_protocol_shorthand() {
+        let tokens: Vec<String> = "фин hy2".split_whitespace().map(str::to_lowercase).collect();
+        assert!(matches_node_query(
+            "🇫🇮 🎮 ⚡️ ⭐️ Финляндия #2",
+            "hysteria2",
+            &tokens
+        ));
+        assert!(!matches_node_query(
+            "🇫🇮 🎮 ⚡️ ⭐️ Финляндия #2",
+            "vless",
+            &tokens
+        ));
+    }
 }
