@@ -529,14 +529,25 @@ pub fn build_shoes_config(
     rules_dir: &Path,
     clash_secret: &str,
     tun_mtu: u16,
+    preferred_default: Option<&str>,
 ) -> Result<serde_yaml_ng::Value> {
-    let default_node = node_tags
-        .first()
-        .cloned()
+    let default_node = preferred_default
+        .filter(|p| node_tags.iter().any(|t| t == p))
+        .map(str::to_string)
+        .or_else(|| node_tags.first().cloned())
         .unwrap_or_else(|| "direct".to_string());
     let tun_mtu_val = serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(u64::from(tun_mtu)));
 
     let mut seq = Vec::new();
+    let global_settings = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(
+        r#"
+global_settings:
+  max_connections: 2048
+  reload_grace_secs: 15
+"#,
+    )?;
+    seq.push(global_settings);
+
     let mut api = serde_yaml_ng::Mapping::new();
     api.insert("clash_api_address".into(), "127.0.0.1:9097".into());
     api.insert("secret".into(), clash_secret.into());
@@ -617,10 +628,22 @@ bootstrap_dns:
   - "9.9.9.9:53"
 resource_limits:
   tcp_buffer_size: 32768
+  tcp_memory_bytes: 67108864
+  max_tcp_connections: 512
+  max_udp_sessions: 512
+  max_udp_queued_bytes: 8388608
 dns:
   servers:
     - url: "https://8.8.8.8/dns-query"
       client_chain: "{group_name}"
+      timeout_secs: 3
+      connect_timeout_secs: 3
+      attempts: 2
+    - url: "tls://9.9.9.9"
+      server_name: "dns.quad9.net"
+      timeout_secs: 3
+      connect_timeout_secs: 3
+      attempts: 1
 rules: "desktop-rules"
 "#
     ))?;
@@ -638,6 +661,7 @@ pub fn replace_nodes_in_shoes_config(
     group_name: &str,
     node_tags: &[String],
     node_chains: Vec<serde_yaml_ng::Value>,
+    preferred_default: Option<&str>,
 ) -> Result<()> {
     let entries = doc
         .as_sequence_mut()
@@ -655,8 +679,10 @@ pub fn replace_nodes_in_shoes_config(
                 .get(serde_yaml_ng::Value::String("default".to_string()))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let next_default = existing_default
-                .filter(|d| node_tags.iter().any(|t| t == d))
+            let next_default = preferred_default
+                .filter(|p| node_tags.iter().any(|t| t == p))
+                .map(str::to_string)
+                .or_else(|| existing_default.filter(|d| node_tags.iter().any(|t| t == d)))
                 .or_else(|| node_tags.first().cloned())
                 .unwrap_or_else(|| "direct".to_string());
             map.insert("default".into(), next_default.into());
@@ -818,13 +844,27 @@ proxies:
             Path::new("/usr/local/share/sing-box"),
             "sec",
             1400,
+            Some("Hy2 Node"),
         )
         .unwrap();
+        let seq = cfg.as_sequence().unwrap();
+        assert_eq!(
+            seq.iter()
+                .find(|e| e.get("global_settings").is_some())
+                .and_then(|e| e.get("global_settings"))
+                .and_then(|g| g.get("reload_grace_secs"))
+                .and_then(|v| v.as_u64()),
+            Some(15)
+        );
+        let tun = seq.iter().find(|e| e.get("device_name").is_some()).unwrap();
+        assert_eq!(tun["dns"]["servers"].as_sequence().unwrap().len(), 2);
+        assert_eq!(tun["dns"]["servers"][1]["url"], "tls://9.9.9.9");
         replace_nodes_in_shoes_config(
             &mut cfg,
             "proxy",
-            &["Hy2 Node".into()],
+            &["Reality Non-V4".into(), "Hy2 Node".into()],
             vec![],
+            Some("Reality Non-V4"),
         )
         .unwrap();
         let group = cfg
@@ -833,6 +873,9 @@ proxies:
             .iter()
             .find(|e| e.get("client_group").and_then(|v| v.as_str()) == Some("proxy"))
             .unwrap();
-        assert_eq!(group.get("default").and_then(|v| v.as_str()), Some("Hy2 Node"));
+        assert_eq!(
+            group.get("default").and_then(|v| v.as_str()),
+            Some("Reality Non-V4")
+        );
     }
 }

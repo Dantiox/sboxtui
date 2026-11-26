@@ -116,6 +116,12 @@ fn main() -> Result<()> {
                 explicit => explicit,
             };
             let target_path = output.unwrap_or_else(|| cfg.active_config_path(target_core).to_path_buf());
+            let live_active_node = cfg
+                .resolve_secret()
+                .ok()
+                .and_then(|sec| ClashClient::new(&cfg.clash_api_url, &sec).ok())
+                .and_then(|api| api.get_proxies().ok())
+                .and_then(|p| p.proxies.get(&cfg.default_group).and_then(|g| g.now.clone()));
 
             match target_core {
                 CoreKind::Shoes | CoreKind::Auto => {
@@ -130,6 +136,7 @@ fn main() -> Result<()> {
                             &cfg.default_group,
                             &tags,
                             chains,
+                            live_active_node.as_deref(),
                         )?;
                         existing
                     } else {
@@ -143,6 +150,7 @@ fn main() -> Result<()> {
                             &cfg.rules_dir,
                             &sec,
                             cfg.tun_mtu,
+                            live_active_node.as_deref(),
                         )?
                     };
 

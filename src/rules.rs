@@ -493,6 +493,7 @@ mod tests {
             Path::new("/usr/local/share/sing-box"),
             "sec",
             1400,
+            None,
         )
         .unwrap();
         let initial_len = summarize_shoes_rules(&doc).len();

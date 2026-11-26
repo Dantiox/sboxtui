@@ -805,9 +805,14 @@ impl App {
                 Some(ConfigDoc::Shoes(doc)) => {
                     let (tags, chains) = convert_proxies_to_shoes(&prof.proxies);
                     let count = tags.len();
-                    if let Err(e) =
-                        replace_nodes_in_shoes_config(doc, &self.cfg.default_group, &tags, chains)
-                    {
+                    let preferred = self.active_node.as_deref();
+                    if let Err(e) = replace_nodes_in_shoes_config(
+                        doc,
+                        &self.cfg.default_group,
+                        &tags,
+                        chains,
+                        preferred,
+                    ) {
                         self.status_msg = format!("Update nodes failed: {e}");
                         return;
                     }
