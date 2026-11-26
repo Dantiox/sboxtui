@@ -4,8 +4,8 @@ use crate::clash_sub::{
 };
 use crate::config::AppConfig;
 use crate::net_nm::{
-    NmConnection, active_wifi_ssid, list_interfaces, list_nm_connections, list_process_names,
-    set_connection_state,
+    NmConnection, active_wifi_from_connections, list_interfaces, list_nm_connections,
+    list_process_names, set_connection_state,
 };
 use crate::rules::{
     RuleKind, SaveOutcome, delete_rule, insert_user_rule, read_default_interface,
@@ -31,6 +31,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,16 +105,37 @@ pub struct App {
     modal: Modal,
     last_refresh: Instant,
     should_quit: bool,
+    refresh_tx: Option<Sender<bool>>,
+}
+
+struct RefreshSnapshot {
+    engine_version: Result<String, String>,
+    proxies: Option<BTreeMap<String, ProxyEntry>>,
+    group_nodes: Option<Vec<String>>,
+    active_node: Option<String>,
+    connections: Option<(Vec<ConnectionEntry>, u64, u64)>,
+    nm_conns: Option<Vec<NmConnection>>,
 }
 
 impl App {
     pub fn new(cfg: AppConfig, api: ClashClient) -> Self {
+        let mut singbox_json = None;
+        let mut default_interface = cfg.default_interface.clone();
+        let mut rule_state = TableState::default();
+        if let Ok(raw) = fs::read_to_string(&cfg.singbox_config_path)
+            && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        {
+            default_interface = read_default_interface(&val);
+            singbox_json = Some(val);
+            rule_state.select(Some(0));
+        }
+
         Self {
-            default_interface: cfg.default_interface.clone(),
+            default_interface,
             cfg,
             api,
             tab: Tab::Nodes,
-            status_msg: "Ready. Use 1-4/Tab to navigate, q to quit.".to_string(),
+            status_msg: "Loading telemetry...".to_string(),
             engine_version: None,
             proxies: BTreeMap::new(),
             group_nodes: Vec::new(),
@@ -120,63 +143,66 @@ impl App {
             connections: Vec::new(),
             upload_total: 0,
             download_total: 0,
-            singbox_json: None,
+            singbox_json,
             wifi_ssid: None,
             nm_conns: Vec::new(),
             node_filter: String::new(),
             searching_nodes: false,
             node_state: TableState::default(),
-            rule_state: TableState::default(),
+            rule_state,
             wg_state: TableState::default(),
             conn_state: TableState::default(),
             modal: Modal::None,
-            last_refresh: Instant::now() - Duration::from_secs(60),
+            last_refresh: Instant::now(),
             should_quit: false,
+            refresh_tx: None,
         }
     }
 
     pub fn refresh_all(&mut self) {
         self.last_refresh = Instant::now();
-        self.wifi_ssid = active_wifi_ssid();
-        if let Ok(conns) = list_nm_connections() {
+        if let Some(tx) = &self.refresh_tx {
+            let _ = tx.send(true);
+        }
+    }
+
+    fn apply_snapshot(&mut self, snap: RefreshSnapshot) {
+        if let Some(conns) = snap.nm_conns {
+            self.wifi_ssid = active_wifi_from_connections(&conns);
             self.nm_conns = conns;
             if self.wg_state.selected().is_none() && !self.nm_conns.is_empty() {
                 self.wg_state.select(Some(0));
             }
         }
-        if self.singbox_json.is_none()
-            && let Ok(raw) = fs::read_to_string(&self.cfg.singbox_config_path)
-            && let Ok(val) = serde_json::from_str::<Value>(&raw)
-        {
-            self.default_interface = read_default_interface(&val);
-            self.singbox_json = Some(val);
-            if self.rule_state.selected().is_none() {
-                self.rule_state.select(Some(0));
+        match snap.engine_version {
+            Ok(v) => {
+                if self.engine_version.is_none() && self.status_msg == "Loading telemetry..." {
+                    self.status_msg = "Ready. Use 1-4/Tab to navigate, / to search, q to quit.".to_string();
+                }
+                self.engine_version = Some(v);
             }
-        }
-
-        match self.api.get_version() {
-            Ok(v) => self.engine_version = Some(v.version),
             Err(e) => {
                 self.engine_version = None;
                 self.status_msg = format!("sing-box Clash API unreachable: {e}");
                 return;
             }
         }
-        if let Ok(p) = self.api.get_proxies() {
-            if let Some(grp) = p.proxies.get(&self.cfg.default_group) {
-                self.group_nodes = grp.all.clone();
-                self.active_node = grp.now.clone();
-            }
-            self.proxies = p.proxies;
+        if let Some(nodes) = snap.group_nodes {
+            self.group_nodes = nodes;
             if self.node_state.selected().is_none() && !self.group_nodes.is_empty() {
                 self.node_state.select(Some(0));
             }
         }
-        if let Ok(c) = self.api.get_connections() {
-            self.upload_total = c.upload_total;
-            self.download_total = c.download_total;
-            self.connections = c.connections;
+        if snap.active_node.is_some() {
+            self.active_node = snap.active_node;
+        }
+        if let Some(p) = snap.proxies {
+            self.proxies = p;
+        }
+        if let Some((conns, up, down)) = snap.connections {
+            self.upload_total = up;
+            self.download_total = down;
+            self.connections = conns;
             if self.conn_state.selected().is_none() && !self.connections.is_empty() {
                 self.conn_state.select(Some(0));
             }
@@ -696,6 +722,72 @@ impl App {
     }
 }
 
+fn spawn_poller(
+    api: ClashClient,
+    default_group: String,
+) -> (Sender<bool>, Receiver<RefreshSnapshot>) {
+    let (req_tx, req_rx) = mpsc::channel::<bool>();
+    let (res_tx, res_rx) = mpsc::channel::<RefreshSnapshot>();
+
+    thread::spawn(move || {
+        let mut last_nm = Instant::now() - Duration::from_secs(60);
+        while let Ok(mut force_nm) = req_rx.recv() {
+            // Drain coalesced triggers
+            while let Ok(f) = req_rx.try_recv() {
+                force_nm |= f;
+            }
+
+            let nm_conns = if force_nm || last_nm.elapsed() >= Duration::from_secs(9) {
+                last_nm = Instant::now();
+                list_nm_connections().ok()
+            } else {
+                None
+            };
+
+            let engine_version = api
+                .get_version()
+                .map(|v| v.version)
+                .map_err(|e| e.to_string());
+            let (proxies, group_nodes, active_node, connections) = if engine_version.is_ok() {
+                let (p, gn, an) = match api.get_proxies() {
+                    Ok(resp) => {
+                        let (gn, an) = resp
+                            .proxies
+                            .get(&default_group)
+                            .map(|g| (Some(g.all.clone()), g.now.clone()))
+                            .unwrap_or((None, None));
+                        (Some(resp.proxies), gn, an)
+                    }
+                    Err(_) => (None, None, None),
+                };
+                let conns = api
+                    .get_connections()
+                    .ok()
+                    .map(|c| (c.connections, c.upload_total, c.download_total));
+                (p, gn, an, conns)
+            } else {
+                (None, None, None, None)
+            };
+
+            if res_tx
+                .send(RefreshSnapshot {
+                    engine_version,
+                    proxies,
+                    group_nodes,
+                    active_node,
+                    connections,
+                    nm_conns,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    (req_tx, res_rx)
+}
+
 pub fn run_tui(cfg: AppConfig, api: ClashClient) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -703,21 +795,28 @@ pub fn run_tui(cfg: AppConfig, api: ClashClient) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let (req_tx, res_rx) = spawn_poller(api.clone(), cfg.default_group.clone());
     let mut app = App::new(cfg, api);
-    app.refresh_all();
+    app.refresh_tx = Some(req_tx.clone());
+    // Trigger immediate async load; first frame renders instantaneously without blocking.
+    let _ = req_tx.send(true);
 
     let res = loop {
+        while let Ok(snap) = res_rx.try_recv() {
+            app.apply_snapshot(snap);
+        }
         terminal.draw(|f| draw_ui(f, &mut app))?;
         if app.should_quit {
             break Ok(());
         }
-        if event::poll(Duration::from_millis(250))?
+        if event::poll(Duration::from_millis(80))?
             && let Event::Key(k) = event::read()?
         {
             app.handle_key(k);
         }
         if app.last_refresh.elapsed() >= Duration::from_secs(3) {
-            app.refresh_all();
+            app.last_refresh = Instant::now();
+            let _ = req_tx.send(false);
         }
     };
 

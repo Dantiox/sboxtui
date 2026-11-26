@@ -90,22 +90,13 @@ pub fn list_interfaces() -> Result<Vec<String>> {
     Ok(ifaces)
 }
 
-/// Returns the active Wi-Fi SSID if connected, or `None`.
-pub fn active_wifi_ssid() -> Option<String> {
-    let out = Command::new("nmcli")
-        .args(["-t", "-f", "ACTIVE,SSID", "dev", "wifi"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        if let Some(ssid) = line.strip_prefix("yes:") {
-            let trimmed = ssid.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+/// Extracts active Wi-Fi connection/SSID name from already-queried NetworkManager connections
+/// without triggering a `nmcli dev wifi` radio scan.
+pub fn active_wifi_from_connections(conns: &[NmConnection]) -> Option<String> {
+    conns
+        .iter()
+        .find(|c| c.conn_type == "802-11-wireless" && c.is_active())
+        .map(|c| c.name.clone())
 }
 
 /// Collects sorted unique running process names (`/proc/<pid>/comm`) for `pname(...)` rule picking.

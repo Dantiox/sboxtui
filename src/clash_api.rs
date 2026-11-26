@@ -86,7 +86,9 @@ pub struct ConnectionMeta {
 impl ClashClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(6))
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_millis(800))
+            .timeout(std::time::Duration::from_secs(5))
             .build()?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
