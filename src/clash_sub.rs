@@ -99,6 +99,20 @@ pub fn parse_clash_yaml(yaml_text: &str) -> Result<ClashProfile> {
     serde_yaml_ng::from_str(yaml_text).context("failed to parse Clash YAML subscription")
 }
 
+fn next_unique_tag(base_name: &str, used_tags: &mut HashSet<String>) -> Option<String> {
+    let base_tag = base_name.trim();
+    if base_tag.is_empty() {
+        return None;
+    }
+    let mut tag = base_tag.to_string();
+    let mut n = 2usize;
+    while !used_tags.insert(tag.clone()) {
+        tag = format!("{base_tag} #{n}");
+        n += 1;
+    }
+    Some(tag)
+}
+
 /// Converts Clash `vless` and `hysteria2` proxies into `sing-box` outbound JSON objects.
 pub fn convert_proxies_to_singbox(proxies: &[ClashProxy]) -> (Vec<String>, Vec<Value>) {
     let mut used_tags = HashSet::new();
@@ -106,16 +120,9 @@ pub fn convert_proxies_to_singbox(proxies: &[ClashProxy]) -> (Vec<String>, Vec<V
     let mut outbounds = Vec::new();
 
     for p in proxies {
-        let base_tag = p.name.trim();
-        if base_tag.is_empty() {
+        let Some(tag) = next_unique_tag(&p.name, &mut used_tags) else {
             continue;
-        }
-        let mut tag = base_tag.to_string();
-        let mut n = 2usize;
-        while !used_tags.insert(tag.clone()) {
-            tag = format!("{base_tag} #{n}");
-            n += 1;
-        }
+        };
 
         let ob = match p.proxy_type.as_str() {
             "vless" => build_vless_outbound(&tag, p),
@@ -129,6 +136,137 @@ pub fn convert_proxies_to_singbox(proxies: &[ClashProxy]) -> (Vec<String>, Vec<V
     }
 
     (tags, outbounds)
+}
+
+/// Converts Clash `vless` (non-gRPC) and `hysteria2` proxies into `shoes` `client_chains` YAML entries.
+pub fn convert_proxies_to_shoes(
+    proxies: &[ClashProxy],
+) -> (Vec<String>, Vec<serde_yaml_ng::Value>) {
+    let mut used_tags = HashSet::new();
+    let mut tags = Vec::new();
+    let mut chains = Vec::new();
+
+    for p in proxies {
+        let Some(tag) = next_unique_tag(&p.name, &mut used_tags) else {
+            continue;
+        };
+
+        let chain = match p.proxy_type.as_str() {
+            "vless" => build_shoes_vless_chain(&tag, p),
+            "hysteria2" => build_shoes_hy2_chain(&tag, p),
+            _ => None,
+        };
+        if let Some(val) = chain {
+            tags.push(tag);
+            chains.push(val);
+        }
+    }
+
+    (tags, chains)
+}
+
+fn build_shoes_vless_chain(tag: &str, p: &ClashProxy) -> Option<serde_yaml_ng::Value> {
+    if p.network.as_deref() == Some("grpc") {
+        return None;
+    }
+    let uuid = p.uuid.as_deref()?;
+    let addr = format!("{}:{}", p.server, p.port);
+    let mut inner = serde_yaml_ng::Mapping::new();
+    inner.insert("type".into(), "vless".into());
+    inner.insert("user_id".into(), uuid.into());
+    inner.insert("udp_enabled".into(), true.into());
+    let inner_val = serde_yaml_ng::Value::Mapping(inner);
+
+    let sni = p
+        .servername
+        .as_deref()
+        .or(p.sni.as_deref())
+        .unwrap_or(&p.server);
+
+    let protocol = if let Some(r) = &p.reality_opts {
+        let mut proto = serde_yaml_ng::Mapping::new();
+        proto.insert("type".into(), "reality".into());
+        proto.insert("public_key".into(), r.public_key.as_str().into());
+        proto.insert(
+            "short_id".into(),
+            r.short_id.as_deref().unwrap_or("").into(),
+        );
+        proto.insert("sni_hostname".into(), sni.into());
+        proto.insert(
+            "vision".into(),
+            (p.flow.as_deref() == Some("xtls-rprx-vision")).into(),
+        );
+        proto.insert("protocol".into(), inner_val);
+        serde_yaml_ng::Value::Mapping(proto)
+    } else if p.tls.unwrap_or(false) {
+        let mut proto = serde_yaml_ng::Mapping::new();
+        proto.insert("type".into(), "tls".into());
+        proto.insert("sni_hostname".into(), sni.into());
+        proto.insert("verify".into(), (!p.skip_cert_verify.unwrap_or(false)).into());
+        proto.insert("protocol".into(), inner_val);
+        serde_yaml_ng::Value::Mapping(proto)
+    } else {
+        inner_val
+    };
+
+    let mut hop = serde_yaml_ng::Mapping::new();
+    hop.insert("name".into(), tag.into());
+    hop.insert("address".into(), addr.into());
+    hop.insert("protocol".into(), protocol);
+
+    let mut entry = serde_yaml_ng::Mapping::new();
+    entry.insert(
+        "chain".into(),
+        serde_yaml_ng::Value::Sequence(vec![serde_yaml_ng::Value::Mapping(hop)]),
+    );
+    Some(serde_yaml_ng::Value::Mapping(entry))
+}
+
+fn build_shoes_hy2_chain(tag: &str, p: &ClashProxy) -> Option<serde_yaml_ng::Value> {
+    let password = p.password.as_deref()?;
+    let addr = format!("{}:{}", p.server, p.port);
+    let sni = p
+        .sni
+        .as_deref()
+        .or(p.servername.as_deref())
+        .unwrap_or(&p.server);
+    let alpn: Vec<serde_yaml_ng::Value> = p
+        .alpn
+        .as_ref()
+        .filter(|a| !a.is_empty())
+        .map(|a| a.iter().map(|s| s.as_str().into()).collect())
+        .unwrap_or_else(|| vec!["h3".into()]);
+
+    let mut quic = serde_yaml_ng::Mapping::new();
+    quic.insert("sni_hostname".into(), sni.into());
+    quic.insert("verify".into(), (!p.skip_cert_verify.unwrap_or(false)).into());
+    quic.insert("alpn_protocols".into(), serde_yaml_ng::Value::Sequence(alpn));
+
+    let mut proto = serde_yaml_ng::Mapping::new();
+    proto.insert("type".into(), "hysteria2".into());
+    proto.insert("password".into(), password.into());
+    proto.insert("udp_enabled".into(), true.into());
+    if p.obfs.as_deref() == Some("salamander")
+        && let Some(pw) = &p.obfs_password
+    {
+        let mut obfs = serde_yaml_ng::Mapping::new();
+        obfs.insert("type".into(), "salamander".into());
+        obfs.insert("password".into(), pw.as_str().into());
+        proto.insert("obfs".into(), serde_yaml_ng::Value::Mapping(obfs));
+    }
+
+    let mut hop = serde_yaml_ng::Mapping::new();
+    hop.insert("name".into(), tag.into());
+    hop.insert("address".into(), addr.into());
+    hop.insert("quic_settings".into(), serde_yaml_ng::Value::Mapping(quic));
+    hop.insert("protocol".into(), serde_yaml_ng::Value::Mapping(proto));
+
+    let mut entry = serde_yaml_ng::Mapping::new();
+    entry.insert(
+        "chain".into(),
+        serde_yaml_ng::Value::Sequence(vec![serde_yaml_ng::Value::Mapping(hop)]),
+    );
+    Some(serde_yaml_ng::Value::Mapping(entry))
 }
 
 fn build_vless_outbound(tag: &str, p: &ClashProxy) -> Option<Value> {
@@ -383,6 +521,155 @@ pub fn build_singbox_config(
     })
 }
 
+/// Builds a complete `shoes` desktop YAML configuration from parsed chains.
+pub fn build_shoes_config(
+    group_name: &str,
+    node_tags: &[String],
+    node_chains: Vec<serde_yaml_ng::Value>,
+    rules_dir: &Path,
+    clash_secret: &str,
+    tun_mtu: u16,
+) -> Result<serde_yaml_ng::Value> {
+    let default_node = node_tags
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "direct".to_string());
+    let tun_mtu_val = serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(u64::from(tun_mtu)));
+
+    let mut seq = Vec::new();
+    let mut api = serde_yaml_ng::Mapping::new();
+    api.insert("clash_api_address".into(), "127.0.0.1:9097".into());
+    api.insert("secret".into(), clash_secret.into());
+    seq.push(serde_yaml_ng::Value::Mapping(api));
+
+    let mut cache = serde_yaml_ng::Mapping::new();
+    cache.insert("cache_file_path".into(), "/var/lib/shoes/cache.db".into());
+    seq.push(serde_yaml_ng::Value::Mapping(cache));
+
+    for (name, file) in [
+        ("geoip-ru", "geoip-ru.srs"),
+        ("geosite-ru", "geosite-category-ru.srs"),
+        ("geosite-ads", "geosite-category-ads-all.srs"),
+    ] {
+        let mut rs = serde_yaml_ng::Mapping::new();
+        rs.insert("rule_source_group".into(), name.into());
+        rs.insert(
+            "rules".into(),
+            serde_yaml_ng::Value::Sequence(vec![
+                rules_dir.join(file).to_string_lossy().as_ref().into(),
+            ]),
+        );
+        seq.push(serde_yaml_ng::Value::Mapping(rs));
+    }
+
+    let mut group = serde_yaml_ng::Mapping::new();
+    group.insert("client_group".into(), group_name.into());
+    group.insert("type".into(), "selector".into());
+    group.insert("default".into(), default_node.into());
+    group.insert("client_chains".into(), serde_yaml_ng::Value::Sequence(node_chains));
+    seq.push(serde_yaml_ng::Value::Mapping(group));
+
+    let rules_yaml = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&format!(
+        r#"
+rule_group: "desktop-rules"
+rules:
+  - masks:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+      - "100.64.0.0/10"
+    action: "allow"
+    client_chain:
+      protocol:
+        type: "direct"
+  - conditions:
+      rule_source_group: "geosite-ads"
+    action: "block"
+  - conditions:
+      any:
+        - rule_source_group: "geoip-ru"
+        - rule_source_group: "geosite-ru"
+    action: "allow"
+    client_chain:
+      protocol:
+        type: "direct"
+  - conditions:
+      any_destination: true
+    action: "allow"
+    client_chain: "{group_name}"
+"#
+    ))?;
+    seq.push(rules_yaml);
+
+    let mut tun = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&format!(
+        r#"
+name: "tun-in"
+device_name: "shoes0"
+auto_route: true
+auto_redirect: true
+auto_dns: false
+dns_hijack: true
+addresses:
+  - "10.233.0.1/30"
+route_address:
+  - "0.0.0.0/0"
+bootstrap_dns:
+  - "9.9.9.9:53"
+resource_limits:
+  tcp_buffer_size: 32768
+dns:
+  servers:
+    - url: "https://8.8.8.8/dns-query"
+      client_chain: "{group_name}"
+rules: "desktop-rules"
+"#
+    ))?;
+    if let Some(m) = tun.as_mapping_mut() {
+        m.insert("mtu".into(), tun_mtu_val);
+    }
+    seq.push(tun);
+
+    Ok(serde_yaml_ng::Value::Sequence(seq))
+}
+
+/// Replaces the `client_chains` inside the matching `client_group` entry of a `shoes` config YAML.
+pub fn replace_nodes_in_shoes_config(
+    doc: &mut serde_yaml_ng::Value,
+    group_name: &str,
+    node_tags: &[String],
+    node_chains: Vec<serde_yaml_ng::Value>,
+) -> Result<()> {
+    let entries = doc
+        .as_sequence_mut()
+        .context("shoes config root must be a YAML sequence")?;
+    for item in entries.iter_mut() {
+        let Some(map) = item.as_mapping_mut() else {
+            continue;
+        };
+        if map
+            .get(serde_yaml_ng::Value::String("client_group".to_string()))
+            .and_then(|v| v.as_str())
+            == Some(group_name)
+        {
+            let existing_default = map
+                .get(serde_yaml_ng::Value::String("default".to_string()))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let next_default = existing_default
+                .filter(|d| node_tags.iter().any(|t| t == d))
+                .or_else(|| node_tags.first().cloned())
+                .unwrap_or_else(|| "direct".to_string());
+            map.insert("default".into(), next_default.into());
+            map.insert(
+                "client_chains".into(),
+                serde_yaml_ng::Value::Sequence(node_chains),
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("missing client_group '{group_name}' in shoes config")
+}
+
 /// Replaces the proxy nodes inside an existing `sing-box` `config.json` while keeping user rules.
 pub fn replace_nodes_in_config(
     cfg: &mut Value,
@@ -487,5 +774,65 @@ proxies:
         assert!(bootstrap.get("detour").is_none());
         assert_eq!(cfg["dns"]["final"], "dns-remote");
         assert_eq!(cfg["dns"]["rules"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn converts_and_updates_shoes_yaml_skipping_grpc() {
+        let yaml = r#"
+proxies:
+  - name: "Reality Non-V4"
+    type: vless
+    server: 198.51.100.1
+    port: 443
+    network: tcp
+    uuid: 00000000-0000-0000-0000-000000000001
+    flow: xtls-rprx-vision
+    tls: true
+    servername: cdn.example.net
+    reality-opts:
+      public-key: pubkey123
+      short-id: abcd
+  - name: "Skipped gRPC"
+    type: vless
+    server: 198.51.100.2
+    port: 443
+    network: grpc
+    uuid: 11111111-2222-4333-8444-555555555555
+    tls: true
+  - name: "Hy2 Node"
+    type: hysteria2
+    server: 192.0.2.10
+    port: 30443
+    password: secret
+    obfs: salamander
+    obfs-password: obfspw
+    sni: hy.example.net
+"#;
+        let profile = parse_clash_yaml(yaml).unwrap();
+        let (tags, chains) = convert_proxies_to_shoes(&profile.proxies);
+        assert_eq!(tags, vec!["Reality Non-V4", "Hy2 Node"]);
+        let mut cfg = build_shoes_config(
+            "proxy",
+            &tags,
+            chains,
+            Path::new("/usr/local/share/sing-box"),
+            "sec",
+            1400,
+        )
+        .unwrap();
+        replace_nodes_in_shoes_config(
+            &mut cfg,
+            "proxy",
+            &["Hy2 Node".into()],
+            vec![],
+        )
+        .unwrap();
+        let group = cfg
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|e| e.get("client_group").and_then(|v| v.as_str()) == Some("proxy"))
+            .unwrap();
+        assert_eq!(group.get("default").and_then(|v| v.as_str()), Some("Hy2 Node"));
     }
 }

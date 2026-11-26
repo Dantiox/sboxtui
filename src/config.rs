@@ -3,13 +3,25 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Proxy core managed by `sboxtui`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreKind {
+    #[default]
+    Auto,
+    Shoes,
+    SingBox,
+}
+
 /// User-level configuration for `sboxtui`, stored in `~/.config/sboxtui/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub core: CoreKind,
     pub clash_api_url: String,
     pub api_secret: Option<String>,
     pub api_secret_file: Option<PathBuf>,
+    pub shoes_config_path: PathBuf,
     pub singbox_config_path: PathBuf,
     pub rules_dir: PathBuf,
     pub subscription_url: Option<String>,
@@ -23,9 +35,11 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            core: CoreKind::Auto,
             clash_api_url: "http://127.0.0.1:9097".to_string(),
             api_secret: None,
-            api_secret_file: Some(PathBuf::from("/etc/sing-box/api.secret")),
+            api_secret_file: Some(PathBuf::from("/etc/shoes/api.secret")),
+            shoes_config_path: PathBuf::from("/etc/shoes/desktop.yaml"),
             singbox_config_path: PathBuf::from("/etc/sing-box/config.json"),
             rules_dir: PathBuf::from("/usr/local/share/sing-box"),
             subscription_url: None,
@@ -74,6 +88,30 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Resolves which concrete core (`Shoes` or `SingBox`) is active.
+    pub fn effective_core(&self, engine_version: Option<&str>) -> CoreKind {
+        match self.core {
+            CoreKind::Shoes => CoreKind::Shoes,
+            CoreKind::SingBox => CoreKind::SingBox,
+            CoreKind::Auto => {
+                if engine_version.is_some_and(|v| v.to_ascii_lowercase().contains("shoes"))
+                    || self.shoes_config_path.exists()
+                {
+                    CoreKind::Shoes
+                } else {
+                    CoreKind::SingBox
+                }
+            }
+        }
+    }
+
+    pub fn active_config_path(&self, core: CoreKind) -> &Path {
+        match core {
+            CoreKind::Shoes => &self.shoes_config_path,
+            CoreKind::SingBox | CoreKind::Auto => &self.singbox_config_path,
+        }
+    }
+
     pub fn resolve_secret(&self) -> Result<String> {
         if let Some(s) = &self.api_secret {
             let trimmed = s.trim();
@@ -81,14 +119,22 @@ impl AppConfig {
                 return Ok(trimmed.to_string());
             }
         }
-        if let Some(p) = &self.api_secret_file
-            && p.exists()
-        {
-            let content = fs::read_to_string(p)
-                .with_context(|| format!("failed to read API secret file {}", p.display()))?;
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return Ok(trimmed.to_string());
+        let candidates = self
+            .api_secret_file
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([
+                Path::new("/etc/shoes/api.secret"),
+                Path::new("/etc/sing-box/api.secret"),
+            ]);
+        for p in candidates {
+            if p.exists()
+                && let Ok(content) = fs::read_to_string(p)
+            {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
             }
         }
         anyhow::bail!(

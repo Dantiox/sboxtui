@@ -64,6 +64,60 @@ impl RuleKind {
         }
         obj
     }
+
+    pub fn to_shoes_rule_yaml(self, value: &str, target: &str) -> Result<serde_yaml_ng::Value> {
+        let v = value.trim();
+        let mut rule = serde_yaml_ng::Mapping::new();
+        match self {
+            RuleKind::ProcessName => {
+                anyhow::bail!(
+                    "shoes does not support process_name rules; use IP/CIDR or domain masks"
+                );
+            }
+            RuleKind::GeoIp => {
+                let tag = if v.starts_with("geoip-") {
+                    v.to_string()
+                } else {
+                    format!("geoip-{v}")
+                };
+                let mut cond = serde_yaml_ng::Mapping::new();
+                cond.insert("rule_source_group".into(), tag.into());
+                rule.insert("conditions".into(), serde_yaml_ng::Value::Mapping(cond));
+            }
+            RuleKind::GeoSite => {
+                let tag = if v.starts_with("geosite-") {
+                    v.to_string()
+                } else {
+                    format!("geosite-{v}")
+                };
+                let mut cond = serde_yaml_ng::Mapping::new();
+                cond.insert("rule_source_group".into(), tag.into());
+                rule.insert("conditions".into(), serde_yaml_ng::Value::Mapping(cond));
+            }
+            RuleKind::DomainSuffix | RuleKind::Cidr => {
+                rule.insert(
+                    "masks".into(),
+                    serde_yaml_ng::Value::Sequence(vec![v.into()]),
+                );
+            }
+        }
+
+        if target == "reject" || target == "block" {
+            rule.insert("action".into(), "block".into());
+        } else {
+            rule.insert("action".into(), "allow".into());
+            if target == "direct" {
+                let mut proto = serde_yaml_ng::Mapping::new();
+                proto.insert("type".into(), "direct".into());
+                let mut chain = serde_yaml_ng::Mapping::new();
+                chain.insert("protocol".into(), serde_yaml_ng::Value::Mapping(proto));
+                rule.insert("client_chain".into(), serde_yaml_ng::Value::Mapping(chain));
+            } else {
+                rule.insert("client_chain".into(), target.into());
+            }
+        }
+        Ok(serde_yaml_ng::Value::Mapping(rule))
+    }
 }
 
 /// Human-friendly view of one `route.rules[i]` entry in `sing-box`.
@@ -220,11 +274,36 @@ pub fn validate_singbox_json(cfg: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Saves validated config to `dest` directly if writable, or stages to `~/.local/state/sboxtui/pending-config.json`.
-pub fn save_or_stage_config(cfg: &Value, dest: &Path) -> Result<SaveOutcome> {
-    validate_singbox_json(cfg)?;
-    let body = serde_json::to_string_pretty(cfg)?;
-    if fs::write(dest, &body).is_ok() {
+/// Validates a candidate `shoes` config YAML with `shoes check <tmp>`.
+pub fn validate_shoes_yaml(doc: &serde_yaml_ng::Value) -> Result<()> {
+    let tmp = std::env::temp_dir().join(format!("sboxtui-check-{}.yaml", std::process::id()));
+    let body = serde_yaml_ng::to_string(doc)?;
+    fs::write(&tmp, body)?;
+    let bin = if Path::new("/usr/local/bin/shoes").exists() {
+        "/usr/local/bin/shoes"
+    } else {
+        "shoes"
+    };
+    let out = Command::new(bin)
+        .arg("check")
+        .arg(&tmp)
+        .output()
+        .with_context(|| format!("failed to invoke `{bin} check`"))?;
+    let _ = fs::remove_file(&tmp);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        anyhow::bail!(
+            "shoes check failed: {} {}",
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+    Ok(())
+}
+
+fn write_or_stage_text(body: &str, dest: &Path, staged_name: &str) -> Result<SaveOutcome> {
+    if fs::write(dest, body).is_ok() {
         Ok(SaveOutcome::WrittenDirect)
     } else {
         let home = std::env::var_os("HOME").context("HOME not set")?;
@@ -232,13 +311,144 @@ pub fn save_or_stage_config(cfg: &Value, dest: &Path) -> Result<SaveOutcome> {
             .join(".local")
             .join("state")
             .join("sboxtui")
-            .join("pending-config.json");
+            .join(staged_name);
         if let Some(parent) = staged.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&staged, body)?;
         Ok(SaveOutcome::Staged { staged })
     }
+}
+
+/// Saves validated `sing-box` config to `dest` directly if writable, or stages it.
+pub fn save_or_stage_config(cfg: &Value, dest: &Path) -> Result<SaveOutcome> {
+    validate_singbox_json(cfg)?;
+    let body = serde_json::to_string_pretty(cfg)?;
+    write_or_stage_text(&body, dest, "pending-config.json")
+}
+
+/// Saves validated `shoes` YAML config to `dest` directly if writable, or stages it.
+pub fn save_or_stage_shoes_config(doc: &serde_yaml_ng::Value, dest: &Path) -> Result<SaveOutcome> {
+    validate_shoes_yaml(doc)?;
+    let body = serde_yaml_ng::to_string(doc)?;
+    write_or_stage_text(&body, dest, "pending-desktop.yaml")
+}
+
+fn shoes_rules_seq_mut(
+    doc: &mut serde_yaml_ng::Value,
+) -> Result<&mut Vec<serde_yaml_ng::Value>> {
+    let entries = doc
+        .as_sequence_mut()
+        .context("shoes config root must be a YAML sequence")?;
+    for item in entries.iter_mut() {
+        if item.get("rule_group").is_some()
+            && let Some(seq) = item.get_mut("rules").and_then(|v| v.as_sequence_mut())
+        {
+            return Ok(seq);
+        }
+    }
+    anyhow::bail!("missing rule_group rules array in shoes config")
+}
+
+pub fn summarize_shoes_rules(doc: &serde_yaml_ng::Value) -> Vec<RuleSummary> {
+    let Some(entries) = doc.as_sequence() else {
+        return Vec::new();
+    };
+    let Some(rules) = entries
+        .iter()
+        .find(|item| item.get("rule_group").is_some())
+        .and_then(|item| item.get("rules"))
+        .and_then(|v| v.as_sequence())
+    else {
+        return Vec::new();
+    };
+
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let action = item.get("action").and_then(|v| v.as_str());
+            let chain = item.get("client_chain");
+            let target = if action == Some("block") {
+                "action:block".to_string()
+            } else if let Some(s) = chain.and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if chain
+                .and_then(|v| v.get("protocol"))
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("direct")
+            {
+                "direct".to_string()
+            } else {
+                action.unwrap_or("-").to_string()
+            };
+
+            let any_dest = item
+                .get("conditions")
+                .and_then(|c| c.get("any_destination"))
+                .and_then(|v| v.as_bool())
+                == Some(true);
+            let is_builtin = any_dest;
+
+            let matcher = if let Some(masks) = item.get("masks") {
+                format!("masks={}", compact_yaml(masks))
+            } else if let Some(cond) = item.get("conditions") {
+                if any_dest {
+                    "any_destination=true".to_string()
+                } else {
+                    format!("conditions={}", compact_yaml(cond))
+                }
+            } else {
+                compact_yaml(item)
+            };
+
+            RuleSummary {
+                index,
+                matcher,
+                target,
+                is_builtin,
+            }
+        })
+        .collect()
+}
+
+fn compact_yaml(val: &serde_yaml_ng::Value) -> String {
+    serde_json::to_string(val).unwrap_or_else(|_| "<yaml>".to_string())
+}
+
+pub fn insert_shoes_user_rule(
+    doc: &mut serde_yaml_ng::Value,
+    rule: serde_yaml_ng::Value,
+) -> Result<()> {
+    let rules = shoes_rules_seq_mut(doc)?;
+    let insert_pos = rules
+        .iter()
+        .position(|r| {
+            r.get("conditions")
+                .and_then(|c| c.get("any_destination"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+        })
+        .unwrap_or(rules.len());
+    rules.insert(insert_pos, rule);
+    Ok(())
+}
+
+pub fn delete_shoes_rule(doc: &mut serde_yaml_ng::Value, index: usize) -> Result<()> {
+    let rules = shoes_rules_seq_mut(doc)?;
+    if index < rules.len() {
+        rules.remove(index);
+    }
+    Ok(())
+}
+
+pub fn swap_shoes_rules(doc: &mut serde_yaml_ng::Value, a: usize, b: usize) -> Result<()> {
+    let rules = shoes_rules_seq_mut(doc)?;
+    if a < rules.len() && b < rules.len() {
+        rules.swap(a, b);
+    }
+    Ok(())
 }
 
 pub enum SaveOutcome {
@@ -271,5 +481,29 @@ mod tests {
         assert_eq!(after[2].target, "wg_mw");
         delete_rule(&mut cfg, 2).unwrap();
         assert_eq!(summarize_rules(&cfg).len(), initial_len);
+    }
+
+    #[test]
+    fn manages_shoes_rules_preserving_catch_all() {
+        use crate::clash_sub::build_shoes_config;
+        let mut doc = build_shoes_config(
+            "proxy",
+            &["n1".into()],
+            vec![],
+            Path::new("/usr/local/share/sing-box"),
+            "sec",
+            1400,
+        )
+        .unwrap();
+        let initial_len = summarize_shoes_rules(&doc).len();
+        let rule = RuleKind::Cidr.to_shoes_rule_yaml("198.51.100.0/24", "direct").unwrap();
+        insert_shoes_user_rule(&mut doc, rule).unwrap();
+        let after = summarize_shoes_rules(&doc);
+        assert_eq!(after.len(), initial_len + 1);
+        assert_eq!(after[initial_len - 1].target, "direct");
+        assert!(after[initial_len].is_builtin);
+        assert!(RuleKind::ProcessName.to_shoes_rule_yaml("firefox", "direct").is_err());
+        delete_shoes_rule(&mut doc, initial_len - 1).unwrap();
+        assert_eq!(summarize_shoes_rules(&doc).len(), initial_len);
     }
 }

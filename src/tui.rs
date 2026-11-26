@@ -1,15 +1,17 @@
 use crate::clash_api::{ClashClient, ConnectionEntry, ProxyEntry};
 use crate::clash_sub::{
-    convert_proxies_to_singbox, fetch_clash_subscription, replace_nodes_in_config,
+    convert_proxies_to_shoes, convert_proxies_to_singbox, fetch_clash_subscription,
+    replace_nodes_in_config, replace_nodes_in_shoes_config,
 };
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CoreKind};
 use crate::net_nm::{
     NmConnection, active_wifi_from_connections, list_interfaces, list_nm_connections,
     list_process_names, set_connection_state,
 };
 use crate::rules::{
-    RuleKind, SaveOutcome, delete_rule, insert_user_rule, read_default_interface,
-    save_or_stage_config, set_default_interface, summarize_rules, swap_rules,
+    RuleKind, RuleSummary, SaveOutcome, delete_rule, delete_shoes_rule, insert_shoes_user_rule,
+    insert_user_rule, read_default_interface, save_or_stage_config, save_or_stage_shoes_config,
+    set_default_interface, summarize_rules, summarize_shoes_rules, swap_rules, swap_shoes_rules,
 };
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -76,6 +78,34 @@ enum AddRuleStep {
     Target,
 }
 
+enum ConfigDoc {
+    Shoes(serde_yaml_ng::Value),
+    SingBox(Value),
+}
+
+impl ConfigDoc {
+    fn summarize_rules(&self) -> Vec<RuleSummary> {
+        match self {
+            Self::Shoes(doc) => summarize_shoes_rules(doc),
+            Self::SingBox(cfg) => summarize_rules(cfg),
+        }
+    }
+
+    fn delete_rule(&mut self, index: usize) -> Result<()> {
+        match self {
+            Self::Shoes(doc) => delete_shoes_rule(doc, index),
+            Self::SingBox(cfg) => delete_rule(cfg, index),
+        }
+    }
+
+    fn swap_rules(&mut self, a: usize, b: usize) -> Result<()> {
+        match self {
+            Self::Shoes(doc) => swap_shoes_rules(doc, a, b),
+            Self::SingBox(cfg) => swap_rules(cfg, a, b),
+        }
+    }
+}
+
 pub struct App {
     cfg: AppConfig,
     api: ClashClient,
@@ -90,7 +120,7 @@ pub struct App {
     upload_total: u64,
     download_total: u64,
 
-    singbox_json: Option<Value>,
+    config_doc: Option<ConfigDoc>,
     default_interface: String,
     wifi_ssid: Option<String>,
     nm_conns: Vec<NmConnection>,
@@ -119,15 +149,28 @@ struct RefreshSnapshot {
 
 impl App {
     pub fn new(cfg: AppConfig, api: ClashClient) -> Self {
-        let mut singbox_json = None;
+        let mut config_doc = None;
         let mut default_interface = cfg.default_interface.clone();
         let mut rule_state = TableState::default();
-        if let Ok(raw) = fs::read_to_string(&cfg.singbox_config_path)
-            && let Ok(val) = serde_json::from_str::<Value>(&raw)
-        {
-            default_interface = read_default_interface(&val);
-            singbox_json = Some(val);
-            rule_state.select(Some(0));
+        match cfg.effective_core(None) {
+            CoreKind::Shoes => {
+                if let Ok(raw) = fs::read_to_string(&cfg.shoes_config_path)
+                    && let Ok(doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&raw)
+                {
+                    default_interface = "auto-route".to_string();
+                    config_doc = Some(ConfigDoc::Shoes(doc));
+                    rule_state.select(Some(0));
+                }
+            }
+            CoreKind::SingBox | CoreKind::Auto => {
+                if let Ok(raw) = fs::read_to_string(&cfg.singbox_config_path)
+                    && let Ok(val) = serde_json::from_str::<Value>(&raw)
+                {
+                    default_interface = read_default_interface(&val);
+                    config_doc = Some(ConfigDoc::SingBox(val));
+                    rule_state.select(Some(0));
+                }
+            }
         }
 
         Self {
@@ -143,7 +186,7 @@ impl App {
             connections: Vec::new(),
             upload_total: 0,
             download_total: 0,
-            singbox_json,
+            config_doc,
             wifi_ssid: None,
             nm_conns: Vec::new(),
             node_filter: String::new(),
@@ -157,6 +200,10 @@ impl App {
             should_quit: false,
             refresh_tx: None,
         }
+    }
+
+    fn active_core(&self) -> CoreKind {
+        self.cfg.effective_core(self.engine_version.as_deref())
     }
 
     pub fn refresh_all(&mut self) {
@@ -183,7 +230,7 @@ impl App {
             }
             Err(e) => {
                 self.engine_version = None;
-                self.status_msg = format!("sing-box Clash API unreachable: {e}");
+                self.status_msg = format!("Clash API unreachable: {e}");
                 return;
             }
         }
@@ -337,9 +384,10 @@ impl App {
             },
             Tab::Rules => {
                 let rule_len = self
-                    .singbox_json
+                    .config_doc
                     .as_ref()
-                    .map(|c| summarize_rules(c).len())
+                    .map(ConfigDoc::summarize_rules)
+                    .map(|r| r.len())
                     .unwrap_or(0);
                 match key.code {
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -349,9 +397,14 @@ impl App {
                         move_table(&mut self.rule_state, rule_len, -1);
                     }
                     KeyCode::Char('a') => {
+                        let default_kind = if self.active_core() == CoreKind::Shoes {
+                            3
+                        } else {
+                            0
+                        };
                         self.modal = Modal::AddRule {
                             step: AddRuleStep::Kind,
-                            kind_idx: 0,
+                            kind_idx: default_kind,
                             value: String::new(),
                             target_idx: 0,
                             procs: list_process_names(),
@@ -359,45 +412,47 @@ impl App {
                         };
                     }
                     KeyCode::Char('d') => {
-                        if let (Some(idx), Some(cfg)) =
-                            (self.rule_state.selected(), self.singbox_json.as_mut())
+                        if let (Some(idx), Some(doc)) =
+                            (self.rule_state.selected(), self.config_doc.as_mut())
                         {
-                            let summary = summarize_rules(cfg);
+                            let summary = doc.summarize_rules();
                             if summary.get(idx).is_some_and(|r| !r.is_builtin) {
-                                let _ = delete_rule(cfg, idx);
+                                let _ = doc.delete_rule(idx);
                                 self.status_msg =
                                     "Rule deleted in buffer. Press 'w' to validate & save."
                                         .to_string();
                             } else {
-                                self.status_msg = "Built-in sniff/dns rules stay pinned.".to_string();
+                                self.status_msg = "Built-in rules stay pinned.".to_string();
                             }
                         }
                     }
                     KeyCode::Char('K') => {
-                        if let (Some(idx), Some(cfg)) =
-                            (self.rule_state.selected(), self.singbox_json.as_mut())
+                        if let (Some(idx), Some(doc)) =
+                            (self.rule_state.selected(), self.config_doc.as_mut())
                             && idx > 0
                         {
-                            let summary = summarize_rules(cfg);
+                            let summary = doc.summarize_rules();
                             if summary.get(idx - 1).is_some_and(|r| !r.is_builtin) {
-                                let _ = swap_rules(cfg, idx, idx - 1);
+                                let _ = doc.swap_rules(idx, idx - 1);
                                 self.rule_state.select(Some(idx - 1));
                             }
                         }
                     }
                     KeyCode::Char('J') => {
-                        if let (Some(idx), Some(cfg)) =
-                            (self.rule_state.selected(), self.singbox_json.as_mut())
+                        if let (Some(idx), Some(doc)) =
+                            (self.rule_state.selected(), self.config_doc.as_mut())
                             && idx + 1 < rule_len
                         {
-                            let summary = summarize_rules(cfg);
-                            if summary.get(idx).is_some_and(|r| !r.is_builtin) {
-                                let _ = swap_rules(cfg, idx, idx + 1);
+                            let summary = doc.summarize_rules();
+                            if summary.get(idx).is_some_and(|r| !r.is_builtin)
+                                && summary.get(idx + 1).is_some_and(|r| !r.is_builtin)
+                            {
+                                let _ = doc.swap_rules(idx, idx + 1);
                                 self.rule_state.select(Some(idx + 1));
                             }
                         }
                     }
-                    KeyCode::Char('w') => self.save_singbox_config(),
+                    KeyCode::Char('w') => self.save_active_config(),
                     _ => {}
                 }
             }
@@ -425,6 +480,12 @@ impl App {
                     }
                 }
                 KeyCode::Char('u') => {
+                    if self.active_core() == CoreKind::Shoes {
+                        self.status_msg =
+                            "shoes auto_route automatically follows the kernel default route."
+                                .to_string();
+                        return;
+                    }
                     let mut ifaces = list_interfaces().unwrap_or_default();
                     ifaces.insert(0, "auto".to_string());
                     if !ifaces.iter().any(|x| x == &self.cfg.wg_lan_connection) {
@@ -515,7 +576,7 @@ impl App {
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let targets = self.available_targets();
         let mut next_modal = None;
-        let mut add_rule_val: Option<Value> = None;
+        let mut add_rule_req: Option<(RuleKind, String, String)> = None;
         let mut new_iface: Option<String> = None;
 
         match &mut self.modal {
@@ -633,8 +694,11 @@ impl App {
                         }
                         KeyCode::Enter => {
                             if !value.trim().is_empty() {
-                                let kind = RuleKind::ALL[*kind_idx];
-                                add_rule_val = Some(kind.to_rule_json(value, &targets[*target_idx]));
+                                add_rule_req = Some((
+                                    RuleKind::ALL[*kind_idx],
+                                    value.clone(),
+                                    targets[*target_idx].clone(),
+                                ));
                             }
                             next_modal = Some(Modal::None);
                         }
@@ -647,11 +711,24 @@ impl App {
         if let Some(m) = next_modal {
             self.modal = m;
         }
-        if let Some(rule) = add_rule_val
-            && let Some(cfg) = self.singbox_json.as_mut()
-            && insert_user_rule(cfg, rule).is_ok()
-        {
-            self.save_singbox_config();
+        if let Some((kind, val, target)) = add_rule_req {
+            match self.config_doc.as_mut() {
+                Some(ConfigDoc::SingBox(cfg)) => {
+                    let rule = kind.to_rule_json(&val, &target);
+                    if insert_user_rule(cfg, rule).is_ok() {
+                        self.save_active_config();
+                    }
+                }
+                Some(ConfigDoc::Shoes(doc)) => match kind.to_shoes_rule_yaml(&val, &target) {
+                    Ok(rule) => {
+                        if insert_shoes_user_rule(doc, rule).is_ok() {
+                            self.save_active_config();
+                        }
+                    }
+                    Err(e) => self.status_msg = format!("Rule not added: {e}"),
+                },
+                None => self.status_msg = "No config loaded.".to_string(),
+            }
         }
         if let Some(iface) = new_iface {
             let mtu = if iface == self.cfg.wg_lan_connection {
@@ -659,35 +736,60 @@ impl App {
             } else {
                 self.cfg.tun_mtu
             };
-            if let Some(cfg) = self.singbox_json.as_mut()
+            if let Some(ConfigDoc::SingBox(cfg)) = self.config_doc.as_mut()
                 && set_default_interface(cfg, &iface, mtu).is_ok()
             {
                 self.default_interface = iface;
-                self.save_singbox_config();
+                self.save_active_config();
             }
         }
     }
 
-    fn save_singbox_config(&mut self) {
-        let Some(cfg) = &self.singbox_json else {
-            self.status_msg = "No sing-box config loaded.".to_string();
+    fn save_active_config(&mut self) {
+        let Some(doc) = &self.config_doc else {
+            self.status_msg = "No config loaded.".to_string();
             return;
         };
-        match save_or_stage_config(cfg, &self.cfg.singbox_config_path) {
-            Ok(SaveOutcome::WrittenDirect) => {
-                self.status_msg = format!(
-                    "Validated & saved {}. Restart sing-box.service to apply.",
-                    self.cfg.singbox_config_path.display()
-                );
+        match doc {
+            ConfigDoc::Shoes(yaml_doc) => {
+                match save_or_stage_shoes_config(yaml_doc, &self.cfg.shoes_config_path) {
+                    Ok(SaveOutcome::WrittenDirect) => {
+                        self.status_msg = format!(
+                            "Validated & saved {} (shoes auto-reloads).",
+                            self.cfg.shoes_config_path.display()
+                        );
+                    }
+                    Ok(SaveOutcome::Staged { staged }) => {
+                        self.status_msg = format!(
+                            "Validated & staged -> {} (run0 install -o root -g techpriest -m 0640 {} {})",
+                            staged.display(),
+                            staged.display(),
+                            self.cfg.shoes_config_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Validation/save failed: {e}");
+                    }
+                }
             }
-            Ok(SaveOutcome::Staged { staged }) => {
-                self.status_msg = format!(
-                    "Validated & staged -> {} (run0 install + systemctl restart sing-box)",
-                    staged.display()
-                );
-            }
-            Err(e) => {
-                self.status_msg = format!("Validation/save failed: {e}");
+            ConfigDoc::SingBox(cfg) => {
+                match save_or_stage_config(cfg, &self.cfg.singbox_config_path) {
+                    Ok(SaveOutcome::WrittenDirect) => {
+                        self.status_msg = format!(
+                            "Validated & saved {}. Restart sing-box.service to apply.",
+                            self.cfg.singbox_config_path.display()
+                        );
+                    }
+                    Ok(SaveOutcome::Staged { staged }) => {
+                        self.status_msg = format!(
+                            "Validated & staged -> {} (run0 install + systemctl restart sing-box)",
+                            staged.display()
+                        );
+                    }
+                    Err(e) => {
+                        self.status_msg = format!("Validation/save failed: {e}");
+                    }
+                }
             }
         }
     }
@@ -699,10 +801,22 @@ impl App {
             return;
         };
         match fetch_clash_subscription(&url) {
-            Ok(prof) => {
-                let (tags, outbounds) = convert_proxies_to_singbox(&prof.proxies);
-                let count = tags.len();
-                if let Some(cfg) = self.singbox_json.as_mut() {
+            Ok(prof) => match self.config_doc.as_mut() {
+                Some(ConfigDoc::Shoes(doc)) => {
+                    let (tags, chains) = convert_proxies_to_shoes(&prof.proxies);
+                    let count = tags.len();
+                    if let Err(e) =
+                        replace_nodes_in_shoes_config(doc, &self.cfg.default_group, &tags, chains)
+                    {
+                        self.status_msg = format!("Update nodes failed: {e}");
+                        return;
+                    }
+                    self.save_active_config();
+                    self.status_msg = format!("Synced {count} shoes nodes. {}", self.status_msg);
+                }
+                Some(ConfigDoc::SingBox(cfg)) => {
+                    let (tags, outbounds) = convert_proxies_to_singbox(&prof.proxies);
+                    let count = tags.len();
                     if let Err(e) = replace_nodes_in_config(
                         cfg,
                         &self.cfg.default_group,
@@ -713,10 +827,13 @@ impl App {
                         self.status_msg = format!("Update nodes failed: {e}");
                         return;
                     }
-                    self.save_singbox_config();
+                    self.save_active_config();
                     self.status_msg = format!("Synced {count} nodes. {}", self.status_msg);
                 }
-            }
+                None => {
+                    self.status_msg = "No config file loaded to sync into.".to_string();
+                }
+            },
             Err(e) => self.status_msg = format!("Subscription fetch failed: {e}"),
         }
     }
@@ -864,12 +981,15 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let titles: Vec<Line> = Tab::TITLES.iter().map(|t| Line::from(*t)).collect();
+    let core = app.active_core();
+    let title_text = match core {
+        CoreKind::Shoes => " sboxtui — shoes (smoltcp+redirect) & WireGuard Control (AGPL-3.0) ",
+        CoreKind::SingBox | CoreKind::Auto => {
+            " sboxtui — sing-box (gvisor stack) & WireGuard Control (AGPL-3.0) "
+        }
+    };
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" sboxtui — sing-box (gvisor stack) & WireGuard Control (AGPL-3.0) "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title_text))
         .select(app.tab as usize)
         .highlight_style(
             Style::default()
@@ -893,7 +1013,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
         match app.tab {
             Tab::Nodes => "[1-4/Tab] Tabs | [j/k] Move | [Enter] Select | [/ or f] Live Search | [Esc] Clear | [p] Delay | [s] Sync | [q] Quit",
             Tab::Rules => "[j/k] Move | [a] Add Rule (process/geoip/geosite/cidr) | [d] Delete | [K/J] Priority | [w] Validate & Save | [q] Quit",
-            Tab::WireGuard => "[j/k] Move | [Enter/Space] Toggle NM WG/Wi-Fi | [u] Set sing-box Uplink | [R] Refresh | [q] Quit",
+            Tab::WireGuard => "[j/k] Move | [Enter/Space] Toggle NM WG/Wi-Fi | [u] Set Uplink | [R] Refresh | [q] Quit",
             Tab::Connections => "[j/k] Move | [a] Add process_name Rule from Selected | [R] Refresh | [q] Quit",
         }
     };
@@ -909,8 +1029,28 @@ fn draw_ui(f: &mut ratatui::Frame, app: &mut App) {
     draw_modal(f, app);
 }
 
+fn format_core_label(engine_version: Option<&str>, core: CoreKind) -> String {
+    match engine_version {
+        Some(ver) if ver.to_ascii_lowercase().starts_with("shoes") => ver.to_string(),
+        Some(ver) if ver.to_ascii_lowercase().starts_with("sing-box") => ver.to_string(),
+        Some(ver) => match core {
+            CoreKind::Shoes => format!("shoes {ver}"),
+            CoreKind::SingBox | CoreKind::Auto => format!("sing-box {ver}"),
+        },
+        None => match core {
+            CoreKind::Shoes => "shoes offline".to_string(),
+            CoreKind::SingBox | CoreKind::Auto => "sing-box offline".to_string(),
+        },
+    }
+}
+
 fn draw_stats_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let ver = app.engine_version.as_deref().unwrap_or("offline");
+    let core = app.active_core();
+    let core_label = format_core_label(app.engine_version.as_deref(), core);
+    let stack = match core {
+        CoreKind::Shoes => "smoltcp+redirect",
+        CoreKind::SingBox | CoreKind::Auto => "gvisor",
+    };
     let active_node = app.active_node.as_deref().unwrap_or("none");
     let ssid = app.wifi_ssid.as_deref().unwrap_or("disconnected");
     let up = fmt_bytes(app.upload_total);
@@ -920,7 +1060,7 @@ fn draw_stats_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::raw("Core: "),
             Span::styled(
-                format!("sing-box {ver}"),
+                core_label,
                 Style::default()
                     .fg(if app.engine_version.is_some() {
                         Color::Green
@@ -930,7 +1070,7 @@ fn draw_stats_banner(f: &mut ratatui::Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                " | Stack: gvisor | Uplink: {} (Wi-Fi: {ssid})",
+                " | Stack: {stack} | Uplink: {} (Wi-Fi: {ssid})",
                 app.default_interface
             )),
         ]),
@@ -1033,10 +1173,11 @@ fn draw_nodes_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn draw_rules_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let summaries = app
-        .singbox_json
+        .config_doc
         .as_ref()
-        .map(summarize_rules)
+        .map(ConfigDoc::summarize_rules)
         .unwrap_or_default();
+    let cfg_path = app.cfg.active_config_path(app.active_core());
     let rows: Vec<Row> = summaries
         .iter()
         .map(|r| {
@@ -1068,7 +1209,7 @@ fn draw_rules_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Routing Rules ({}) ", app.cfg.singbox_config_path.display())),
+            .title(format!(" Routing Rules ({}) ", cfg_path.display())),
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray));
     f.render_stateful_widget(table, area, &mut app.rule_state);
@@ -1095,7 +1236,7 @@ fn draw_wg_tab(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let title = format!(
-        " NetworkManager WireGuard & Wi-Fi | sing-box uplink = {} ",
+        " NetworkManager WireGuard & Wi-Fi | uplink = {} ",
         app.default_interface
     );
     let table = Table::new(
@@ -1311,5 +1452,13 @@ mod tests {
             "vless",
             &tokens
         ));
+        assert_eq!(
+            format_core_label(Some("shoes 0.3.8"), CoreKind::Shoes),
+            "shoes 0.3.8"
+        );
+        assert_eq!(
+            format_core_label(Some("1.14.4"), CoreKind::SingBox),
+            "sing-box 1.14.4"
+        );
     }
 }
