@@ -358,7 +358,7 @@ pub fn build_singbox_config(
         },
         "dns": {
             "servers": [
-                { "tag": "dns-local", "type": "udp", "server": "1.1.1.1" },
+                { "tag": "dns-local", "type": "tls", "server": "77.88.8.8", "detour": "direct" },
                 { "tag": "dns-remote", "type": "https", "server": "8.8.8.8", "detour": group_name }
             ],
             "rules": [
