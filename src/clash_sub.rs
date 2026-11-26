@@ -296,7 +296,7 @@ pub fn build_singbox_config(
     }
 
     let mut route = json!({
-        "default_domain_resolver": "dns-local",
+        "default_domain_resolver": "dns-bootstrap",
         "rule_set": [
             {
                 "tag": "geoip-ru",
@@ -326,6 +326,7 @@ pub fn build_singbox_config(
             },
             { "ip_is_private": true, "outbound": "direct" },
             { "ip_cidr": ["100.64.0.0/10"], "outbound": "direct" },
+            { "ip_cidr": ["9.9.9.9/32"], "outbound": "direct" },
             { "rule_set": ["geosite-category-ads-all"], "action": "reject" },
             { "rule_set": ["geoip-ru", "geosite-category-ru"], "outbound": "direct" }
         ],
@@ -358,12 +359,10 @@ pub fn build_singbox_config(
         },
         "dns": {
             "servers": [
-                { "tag": "dns-local", "type": "tls", "server": "77.88.8.8" },
+                { "tag": "dns-bootstrap", "type": "tls", "server": "9.9.9.9" },
                 { "tag": "dns-remote", "type": "https", "server": "8.8.8.8", "detour": group_name }
             ],
-            "rules": [
-                { "rule_set": ["geosite-category-ru"], "server": "dns-local" }
-            ],
+            "rules": [],
             "final": "dns-remote",
             "strategy": "ipv4_only"
         },
@@ -470,7 +469,7 @@ proxies:
     }
 
     #[test]
-    fn dns_local_never_sets_detour_direct() {
+    fn dns_uses_remote_doh_and_quad9_bootstrap_without_detour_direct() {
         let cfg = build_singbox_config(
             "proxy",
             &["n1".into()],
@@ -481,10 +480,12 @@ proxies:
             "wg_mw",
             1400,
         );
-        let local_dns = &cfg["dns"]["servers"][0];
-        assert_eq!(local_dns["tag"], "dns-local");
-        assert_eq!(local_dns["type"], "tls");
-        assert_eq!(local_dns["server"], "77.88.8.8");
-        assert!(local_dns.get("detour").is_none());
+        let bootstrap = &cfg["dns"]["servers"][0];
+        assert_eq!(bootstrap["tag"], "dns-bootstrap");
+        assert_eq!(bootstrap["type"], "tls");
+        assert_eq!(bootstrap["server"], "9.9.9.9");
+        assert!(bootstrap.get("detour").is_none());
+        assert_eq!(cfg["dns"]["final"], "dns-remote");
+        assert_eq!(cfg["dns"]["rules"].as_array().unwrap().len(), 0);
     }
 }
