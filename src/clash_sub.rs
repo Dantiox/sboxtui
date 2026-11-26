@@ -358,7 +358,7 @@ pub fn build_singbox_config(
         },
         "dns": {
             "servers": [
-                { "tag": "dns-local", "type": "tls", "server": "77.88.8.8", "detour": "direct" },
+                { "tag": "dns-local", "type": "tls", "server": "77.88.8.8" },
                 { "tag": "dns-remote", "type": "https", "server": "8.8.8.8", "detour": group_name }
             ],
             "rules": [
@@ -467,5 +467,24 @@ proxies:
         assert_eq!(outbounds[1]["type"], "hysteria2");
         assert_eq!(outbounds[1]["obfs"]["type"], "salamander");
         assert_eq!(outbounds[1]["obfs"]["password"], "obfspw");
+    }
+
+    #[test]
+    fn dns_local_never_sets_detour_direct() {
+        let cfg = build_singbox_config(
+            "proxy",
+            &["n1".into()],
+            vec![],
+            Path::new("/usr/local/share/sing-box"),
+            "sec",
+            "auto",
+            "wg_mw",
+            1400,
+        );
+        let local_dns = &cfg["dns"]["servers"][0];
+        assert_eq!(local_dns["tag"], "dns-local");
+        assert_eq!(local_dns["type"], "tls");
+        assert_eq!(local_dns["server"], "77.88.8.8");
+        assert!(local_dns.get("detour").is_none());
     }
 }
